@@ -5,3 +5,5 @@ The core of the script is an on-chart DOM panel that overlays cleanly on either 
 You don't have to manually hunt for heavy levels, either. The script features smart outlier detection that automatically calculates standard deviations to highlight price levels experiencing extreme, anomalous buy or sell pressure. On top of that, it draws a dynamic Point of Control (POC) dashed line and label right on your candlestick chart to clearly mark the heaviest volume node.
 
 Alongside the DOM, there is an integrated live Time & Sales tape that logs the direction, exact time, price, and size of recent trades. You can even set a custom size threshold to instantly highlight massive block orders or "whales" directly on the tape. Everything is highly customizable, allowing you to choose whether to track data for the current active session only or set a custom historical lookback window to fit your trading style. Just copy the code, paste it into your Pine Editor, and apply it to your chart!
+
+<img width="830" height="481" alt="Screenshot 2026-04-24 at 23 42 08" src="https://github.com/user-attachments/assets/b2f02894-82e9-4fd7-aff8-5ea75fddfbb3" />
