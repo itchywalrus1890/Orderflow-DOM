@@ -1,0 +1,392 @@
+//@version=5
+indicator("Custom DOM - Bookmap Style", overlay=true, max_bars_back=5000, max_boxes_count=500, max_lines_count=500)
+
+// ─────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────
+grp_general      = "General Settings"
+tickSize         = input.float(0.25, "Tick Size (points per level)", options=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0], group=grp_general)
+lookback         = input.int(1500,   "Lookback Bars (SVP / VPB / VPS / VPD)", minval=50,  maxval=5000, group=grp_general)
+numLevels        = input.int(40,     "Visible DOM Levels",               minval=10, maxval=80, group=grp_general)
+tablePos         = input.string("Right", "Table Position", options=["Left","Right"], group=grp_general)
+recentBars       = input.int(8,      "Recent Bid/Ask Bars (proxy for resting depth)", minval=1, maxval=100, group=grp_general)
+
+grp_outlier      = "Outlier Highlighting"
+outlierMult      = input.float(2.0,  "Outlier Threshold (x StdDev)", minval=1.0, maxval=5.0, step=0.1, group=grp_outlier)
+extremeMult      = input.float(3.5,  "Extreme Outlier Threshold (x StdDev)", minval=1.5, maxval=8.0, step=0.1, group=grp_outlier)
+
+grp_mode         = "Display Mode"
+realtimeMode     = input.bool(false, "Session Only Mode (ON = current session, OFF = historical lookback)", group=grp_mode)
+
+grp_tape         = "Time & Sales Tape"
+showTape         = input.bool(true,   "Show Time & Sales Tape",        group=grp_tape)
+tapeRows         = input.int(25,      "Max Tape Rows",                 minval=5,  maxval=50,   group=grp_tape)
+tapeMinSize      = input.float(0.0,   "Min Size Filter (0 = all)",     minval=0,  step=10,     group=grp_tape)
+tapeLargeSize    = input.float(1000.0,"Large Order Highlight Threshold",minval=0,  step=100,    group=grp_tape)
+
+grp_bar          = "Bar Settings"
+barMaxWidth      = input.int(10,     "Max Bar Width (chars)", minval=3, maxval=20, group=grp_bar)
+
+grp_color        = "Colors"
+buyColor         = input.color(color.rgb(50, 130, 220),  "Buy (VPB) Color",        group=grp_color)
+sellColor        = input.color(color.rgb(220, 60, 60),   "Sell (VPS) Color",       group=grp_color)
+svpColor         = input.color(color.rgb(130, 130, 130), "SVP Color",              group=grp_color)
+bidColor         = input.color(color.rgb(40, 110, 200),  "Bid Col Text",           group=grp_color)
+askColor         = input.color(color.rgb(210, 70, 70),   "Ask Col Text",           group=grp_color)
+outlierBuyColor  = input.color(color.rgb(100, 220, 255), "Outlier Buy Color",      group=grp_color)
+outlierSellColor = input.color(color.rgb(255, 130, 130), "Outlier Sell Color",     group=grp_color)
+extremeBuyColor  = input.color(color.rgb(200, 255, 255), "Extreme Buy Highlight",  group=grp_color)
+extremeSellColor = input.color(color.rgb(255, 210, 210), "Extreme Sell Highlight", group=grp_color)
+
+// ─────────────────────────────────────────
+// BUCKETING HELPERS
+// ─────────────────────────────────────────
+roundToTick(p) =>
+    math.round(p / tickSize) * tickSize
+
+// Approximate buy/sell split for a bar from OHLC
+getBuySellVol(barVol, h, l, c) =>
+    range_ = h - l
+    buyFrac = range_ > 0 ? (c - l) / range_ : 0.5
+    [barVol * buyFrac, barVol * (1.0 - buyFrac)]
+
+// ─────────────────────────────────────────
+// ACCUMULATION (rebuilt each update on barstate.islast)
+// Maps keyed by price → volume (fast lookup, no inner search loop)
+// ─────────────────────────────────────────
+var map<float, float> buyMap    = map.new<float, float>()
+var map<float, float> sellMap   = map.new<float, float>()
+var map<float, float> recentBuy = map.new<float, float>()   // Ask-proxy (buy-side aggression)
+var map<float, float> recentSell= map.new<float, float>()   // Bid-proxy (sell-side aggression)
+
+// Track start of current session (new calendar day)
+var int sessionStartBar = 0
+if ta.change(time("D")) != 0
+    sessionStartBar := bar_index
+
+// ─── Time & Sales tape (newest at index 0) ───
+var array<int>   tapeTime  = array.new<int>()
+var array<float> tapePrice = array.new<float>()
+var array<float> tapeVol   = array.new<float>()
+var array<int>   tapeSide  = array.new<int>()   // 1 = buy, -1 = sell
+
+addTo(m, key, val) =>
+    cur = map.contains(m, key) ? map.get(m, key) : 0.0
+    map.put(m, key, cur + val)
+
+if barstate.islast
+    map.clear(buyMap)
+    map.clear(sellMap)
+    map.clear(recentBuy)
+    map.clear(recentSell)
+
+    startBar  = realtimeMode ? sessionStartBar : math.max(0, bar_index - lookback)
+    totalBars = bar_index - startBar
+
+    for i = 0 to totalBars - 1
+        barH = high[i]
+        barL = low[i]
+        barC = close[i]
+        barV = volume[i]
+
+        [bv, sv] = getBuySellVol(barV, barH, barL, barC)
+
+        // Distribute this bar's volume across every tick it spans.
+        loTick = roundToTick(barL)
+        hiTick = roundToTick(barH)
+        steps  = math.max(1, int((hiTick - loTick) / tickSize) + 1)
+        perBuy  = bv / steps
+        perSell = sv / steps
+
+        for s = 0 to steps - 1
+            p = loTick + s * tickSize
+            addTo(buyMap,  p, perBuy)
+            addTo(sellMap, p, perSell)
+            if i < recentBars
+                addTo(recentBuy,  p, perBuy)
+                addTo(recentSell, p, perSell)
+
+// ─────────────────────────────────────────
+// TIME & SALES TAPE ACCUMULATION
+// Runs on every confirmed bar; keeps newest tapeRows entries.
+// ─────────────────────────────────────────
+if barstate.isconfirmed and showTape and volume >= tapeMinSize
+    side = close >= open ? 1 : -1
+    array.unshift(tapeTime,  time)
+    array.unshift(tapePrice, close)
+    array.unshift(tapeVol,   volume)
+    array.unshift(tapeSide,  side)
+    if array.size(tapeTime) > tapeRows
+        array.pop(tapeTime)
+        array.pop(tapePrice)
+        array.pop(tapeVol)
+        array.pop(tapeSide)
+
+// ─────────────────────────────────────────
+// RENDERING
+// ─────────────────────────────────────────
+tblPos = tablePos == "Right" ? position.middle_right : position.middle_left
+var table domTable = na
+
+// Bar growing LEFT from the right edge: filled blocks on the right side of the cell
+// e.g. value 40% of max with width 10 → "      ████"
+barLeft(val, maxVal, maxWidth) =>
+    if maxVal <= 0 or val <= 0
+        str.repeat(" ", maxWidth)
+    else
+        filled = math.round(val / maxVal * maxWidth)
+        filled := math.max(0, math.min(filled, maxWidth))
+        str.repeat(" ", maxWidth - filled) + str.repeat("█", filled)
+
+// Bar growing RIGHT from the left edge
+barRight(val, maxVal, maxWidth) =>
+    if maxVal <= 0 or val <= 0
+        str.repeat(" ", maxWidth)
+    else
+        filled = math.round(val / maxVal * maxWidth)
+        filled := math.max(0, math.min(filled, maxWidth))
+        str.repeat("█", filled) + str.repeat(" ", maxWidth - filled)
+
+// Compact K/M formatting
+fmtVol(v) =>
+    absV = math.abs(v)
+    sign = v < 0 ? "-" : ""
+    absV >= 1000000 ? sign + str.tostring(math.round(absV / 100000) / 10.0) + "M" : absV >= 1000 ? sign + str.tostring(math.round(absV / 100) / 10.0) + "K" : sign + str.tostring(math.round(absV))
+
+// Integer-ish formatting for Bid/Ask columns (like Bookmap shows raw sizes)
+fmtSize(v) =>
+    absV = math.abs(v)
+    absV >= 1000 ? str.tostring(math.round(absV / 100) / 10.0) + "K" : str.tostring(math.round(absV))
+
+if barstate.islast and map.size(buyMap) > 0
+    // ── Build parallel arrays of all keys, sorted by price desc ──
+    keys  = map.keys(buyMap)
+    nAll  = array.size(keys)
+
+    // Bubble sort descending
+    for pass = 0 to nAll - 2
+        for j = 0 to nAll - pass - 2
+            if array.get(keys, j) < array.get(keys, j + 1)
+                t = array.get(keys, j)
+                array.set(keys, j, array.get(keys, j + 1))
+                array.set(keys, j + 1, t)
+
+    // ── Find index closest to current price ──
+    curPrice  = close
+    centerIdx = 0
+    minDist   = 1e10
+    for i = 0 to nAll - 1
+        d = math.abs(array.get(keys, i) - curPrice)
+        if d < minDist
+            minDist   := d
+            centerIdx := i
+
+    half     = math.floor(numLevels / 2)
+    startIdx = math.max(0, centerIdx - half)
+    endIdx   = math.min(nAll - 1, startIdx + numLevels - 1)
+    startIdx := math.max(0, endIdx - numLevels + 1)
+    visCount = endIdx - startIdx + 1
+
+    // ── Stats for visible range (outlier detection & bar scaling) ──
+    maxVPS = 0.0, maxVPB = 0.0, maxVPD = 0.0, maxSVP = 0.0, maxBid = 0.0, maxAsk = 0.0
+    sumD = 0.0, sumDsq = 0.0
+    sumB = 0.0, sumBsq = 0.0
+    sumS = 0.0, sumSsq = 0.0
+
+    for i = startIdx to endIdx
+        p  = array.get(keys, i)
+        bv = map.contains(buyMap,  p) ? map.get(buyMap,  p) : 0.0
+        sv = map.contains(sellMap, p) ? map.get(sellMap, p) : 0.0
+        rb = map.contains(recentBuy,  p) ? map.get(recentBuy,  p) : 0.0
+        rs = map.contains(recentSell, p) ? map.get(recentSell, p) : 0.0
+        tv = bv + sv
+        dv = bv - sv
+
+        if bv > maxVPB
+            maxVPB := bv
+        if sv > maxVPS
+            maxVPS := sv
+        if math.abs(dv) > maxVPD
+            maxVPD := math.abs(dv)
+        if tv > maxSVP
+            maxSVP := tv
+        if rb > maxAsk
+            maxAsk := rb
+        if rs > maxBid
+            maxBid := rs
+
+        sumD   += dv
+        sumDsq += dv * dv
+        sumB   += bv
+        sumBsq += bv * bv
+        sumS   += sv
+        sumSsq += sv * sv
+
+    meanD = visCount > 0 ? sumD / visCount : 0.0
+    varD  = visCount > 1 ? (sumDsq / visCount) - meanD * meanD : 0.0
+    stdD  = math.sqrt(math.max(varD, 0.0))
+
+    meanB = visCount > 0 ? sumB / visCount : 0.0
+    varB  = visCount > 1 ? (sumBsq / visCount) - meanB * meanB : 0.0
+    stdB  = math.sqrt(math.max(varB, 0.0))
+
+    meanS = visCount > 0 ? sumS / visCount : 0.0
+    varS  = visCount > 1 ? (sumSsq / visCount) - meanS * meanS : 0.0
+    stdS  = math.sqrt(math.max(varS, 0.0))
+
+    // ── Build table (DOM + optional inline tape columns) ──
+    tapeN     = showTape ? array.size(tapeTime) : 0
+    totalRows = math.max(visCount, tapeN)
+    numCols   = showTape ? 11 : 7
+
+    if not na(domTable)
+        table.delete(domTable)
+
+    // Columns: VPS | VPB | Bid | Ask | Price | VPD | SVP [| % | TIME | PRICE | SIZE]
+    domTable := table.new(tblPos, columns=numCols, rows=totalRows+1, bgcolor=color.new(color.black, 0), border_width=1, border_color=color.rgb(40,40,40), frame_width=2, frame_color=color.rgb(80,80,80))
+
+    headerTxt = color.new(color.white, 15)
+    headerBg  = color.rgb(20, 20, 20)
+    table.cell(domTable, 0, 0, "VPS",   text_color=headerTxt, bgcolor=headerBg, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(domTable, 1, 0, "VPB",   text_color=headerTxt, bgcolor=headerBg, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(domTable, 2, 0, "Bid",   text_color=headerTxt, bgcolor=headerBg, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(domTable, 3, 0, "Ask",   text_color=headerTxt, bgcolor=headerBg, text_size=size.tiny, text_halign=text.align_center)
+    modeTag = realtimeMode ? "Price\n[SESSION]" : "Price\n[HIST]"
+    table.cell(domTable, 4, 0, modeTag, text_color=headerTxt, bgcolor=headerBg, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(domTable, 5, 0, "VPD",   text_color=headerTxt, bgcolor=headerBg, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(domTable, 6, 0, "SVP",   text_color=headerTxt, bgcolor=headerBg, text_size=size.tiny, text_halign=text.align_center)
+
+    if showTape
+        tapeBg = color.rgb(22, 22, 28)
+        table.cell(domTable, 7,  0, "%",     text_color=headerTxt, bgcolor=tapeBg, text_size=size.tiny, text_halign=text.align_center)
+        table.cell(domTable, 8,  0, "TIME",  text_color=headerTxt, bgcolor=tapeBg, text_size=size.tiny, text_halign=text.align_center)
+        table.cell(domTable, 9,  0, "PRICE", text_color=headerTxt, bgcolor=tapeBg, text_size=size.tiny, text_halign=text.align_center)
+        table.cell(domTable, 10, 0, "SIZE",  text_color=headerTxt, bgcolor=tapeBg, text_size=size.tiny, text_halign=text.align_right)
+
+    // ── Data rows ──
+    for i = 0 to totalRows - 1
+        tableRow   = i + 1
+        cellBg     = color.rgb(16, 16, 16)
+        tapeCellBg = color.rgb(14, 14, 18)
+
+        // ── DOM columns (only within the DOM price range) ──
+        if i < visCount
+            idx = startIdx + i
+            p   = array.get(keys, idx)
+            bv  = map.contains(buyMap,  p) ? map.get(buyMap,  p) : 0.0
+            sv  = map.contains(sellMap, p) ? map.get(sellMap, p) : 0.0
+            rb  = map.contains(recentBuy,  p) ? map.get(recentBuy,  p) : 0.0
+            rs  = map.contains(recentSell, p) ? map.get(recentSell, p) : 0.0
+            tv  = bv + sv
+            dv  = bv - sv
+
+            isCurrent = math.abs(p - curPrice) < tickSize * 0.6
+            rowBg     = isCurrent ? color.rgb(90, 70, 10) : cellBg
+
+            vpsOutlier = stdS > 0 and sv > meanS + outlierMult * stdS
+            vpsExtreme = stdS > 0 and sv > meanS + extremeMult * stdS
+            vpbOutlier = stdB > 0 and bv > meanB + outlierMult * stdB
+            vpbExtreme = stdB > 0 and bv > meanB + extremeMult * stdB
+            vpdOutlier = stdD > 0 and math.abs(dv) > outlierMult * stdD
+            vpdExtreme = stdD > 0 and math.abs(dv) > extremeMult * stdD
+
+            vpsBar  = barLeft(sv, maxVPS, barMaxWidth)
+            vpsTxt  = vpsExtreme ? extremeSellColor : vpsOutlier ? outlierSellColor : sellColor
+            vpsCell = fmtSize(sv) + "  " + vpsBar
+            vpsBg   = vpsExtreme ? color.rgb(90, 15, 15) : vpsOutlier ? color.rgb(55, 15, 15) : cellBg
+            table.cell(domTable, 0, tableRow, vpsCell, text_color=vpsTxt, bgcolor=vpsBg, text_size=size.tiny, text_halign=text.align_right)
+
+            vpbBar  = barLeft(bv, maxVPB, barMaxWidth)
+            vpbTxt  = vpbExtreme ? extremeBuyColor : vpbOutlier ? outlierBuyColor : buyColor
+            vpbCell = fmtSize(bv) + "  " + vpbBar
+            vpbBg   = vpbExtreme ? color.rgb(10, 40, 90) : vpbOutlier ? color.rgb(10, 25, 55) : cellBg
+            table.cell(domTable, 1, tableRow, vpbCell, text_color=vpbTxt, bgcolor=vpbBg, text_size=size.tiny, text_halign=text.align_right)
+
+            bidShade = rs <= 0 ? cellBg : p > curPrice ? cellBg : color.rgb(60, 15, 15)
+            table.cell(domTable, 2, tableRow, rs > 0 ? fmtSize(rs) : "", text_color=bidColor, bgcolor=bidShade, text_size=size.tiny, text_halign=text.align_center)
+
+            askShade = rb <= 0 ? cellBg : p < curPrice ? cellBg : color.rgb(15, 35, 60)
+            table.cell(domTable, 3, tableRow, rb > 0 ? fmtSize(rb) : "", text_color=askColor, bgcolor=askShade, text_size=size.tiny, text_halign=text.align_center)
+
+            priceStr = str.tostring(p, format.mintick)
+            priceTxt = isCurrent ? color.new(color.yellow, 0) : color.new(color.white, 10)
+            table.cell(domTable, 4, tableRow, priceStr, text_color=priceTxt, bgcolor=rowBg, text_size=size.tiny, text_halign=text.align_center)
+
+            vpdBar  = barRight(math.abs(dv), maxVPD, barMaxWidth)
+            isBull  = dv >= 0
+            vpdTxt  = vpdExtreme ? (isBull ? extremeBuyColor : extremeSellColor) : vpdOutlier ? (isBull ? outlierBuyColor : outlierSellColor) : (isBull ? buyColor : sellColor)
+            vpdCell = vpdBar + "  " + (isBull ? "+" : "-") + fmtSize(math.abs(dv))
+            vpdBg   = vpdExtreme ? (isBull ? color.rgb(10, 60, 30) : color.rgb(70, 15, 15)) : vpdOutlier ? (isBull ? color.rgb(10, 35, 20) : color.rgb(45, 12, 12)) : cellBg
+            table.cell(domTable, 5, tableRow, vpdCell, text_color=vpdTxt, bgcolor=vpdBg, text_size=size.tiny, text_halign=text.align_left)
+
+            svpBar   = barRight(tv, maxSVP, barMaxWidth)
+            volRatio = maxSVP > 0 ? tv / maxSVP : 0.0
+            isPOC    = volRatio >= 0.9
+            svpTxt   = isPOC ? color.new(color.white, 0) : svpColor
+            svpCell  = svpBar + "  " + fmtVol(tv)
+            svpBg    = isPOC ? color.rgb(40, 40, 40) : cellBg
+            table.cell(domTable, 6, tableRow, svpCell, text_color=svpTxt, bgcolor=svpBg, text_size=size.tiny, text_halign=text.align_left)
+        else
+            // Extra rows needed by the tape — blank out DOM columns
+            table.cell(domTable, 0, tableRow, "", bgcolor=cellBg, text_size=size.tiny)
+            table.cell(domTable, 1, tableRow, "", bgcolor=cellBg, text_size=size.tiny)
+            table.cell(domTable, 2, tableRow, "", bgcolor=cellBg, text_size=size.tiny)
+            table.cell(domTable, 3, tableRow, "", bgcolor=cellBg, text_size=size.tiny)
+            table.cell(domTable, 4, tableRow, "", bgcolor=cellBg, text_size=size.tiny)
+            table.cell(domTable, 5, tableRow, "", bgcolor=cellBg, text_size=size.tiny)
+            table.cell(domTable, 6, tableRow, "", bgcolor=cellBg, text_size=size.tiny)
+
+        // ── Tape columns (right side of the same table) ──
+        if showTape
+            if i < tapeN
+                tt   = array.get(tapeTime,  i)
+                tp   = array.get(tapePrice, i)
+                tv_t = array.get(tapeVol,   i)
+                ts   = array.get(tapeSide,  i)
+
+                ms      = tt % 1000
+                msStr   = ms < 10 ? "00" + str.tostring(ms) : ms < 100 ? "0" + str.tostring(ms) : str.tostring(ms)
+                timeStr = str.format_time(tt, "HH:mm:ss", syminfo.timezone) + " " + msStr
+
+                isBuyT   = ts > 0
+                isLargeT = tapeLargeSize > 0 and tv_t >= tapeLargeSize
+                tRowBg   = isLargeT ? (isBuyT ? color.rgb(10, 40, 15) : color.rgb(45, 10, 10)) : tapeCellBg
+                dirClr_t = isBuyT ? color.rgb(50, 205, 80) : color.rgb(220, 60, 60)
+                sClr_t   = isLargeT ? color.new(color.white, 0) : color.new(color.white, 25)
+
+                table.cell(domTable, 7,  tableRow, isBuyT ? "▲" : "▼",              text_color=dirClr_t,               bgcolor=tRowBg, text_size=size.tiny, text_halign=text.align_center)
+                table.cell(domTable, 8,  tableRow, timeStr,                           text_color=color.rgb(120,120,120), bgcolor=tRowBg, text_size=size.tiny, text_halign=text.align_left)
+                table.cell(domTable, 9,  tableRow, str.tostring(tp, format.mintick),  text_color=dirClr_t,              bgcolor=tRowBg, text_size=size.tiny, text_halign=text.align_center)
+                table.cell(domTable, 10, tableRow, fmtSize(tv_t),                     text_color=sClr_t,                bgcolor=tRowBg, text_size=size.tiny, text_halign=text.align_right)
+            else
+                table.cell(domTable, 7,  tableRow, "", bgcolor=tapeCellBg, text_size=size.tiny)
+                table.cell(domTable, 8,  tableRow, "", bgcolor=tapeCellBg, text_size=size.tiny)
+                table.cell(domTable, 9,  tableRow, "", bgcolor=tapeCellBg, text_size=size.tiny)
+                table.cell(domTable, 10, tableRow, "", bgcolor=tapeCellBg, text_size=size.tiny)
+
+// ─────────────────────────────────────────
+// POC LINE on chart
+// ─────────────────────────────────────────
+var line  pocLine  = na
+var label pocLabel = na
+
+if barstate.islast and map.size(buyMap) > 0
+    keysAll  = map.keys(buyMap)
+    pocPrice = array.get(keysAll, 0)
+    pocVol   = 0.0
+    for i = 0 to array.size(keysAll) - 1
+        pp = array.get(keysAll, i)
+        bv = map.contains(buyMap,  pp) ? map.get(buyMap,  pp) : 0.0
+        sv = map.contains(sellMap, pp) ? map.get(sellMap, pp) : 0.0
+        tv = bv + sv
+        if tv > pocVol
+            pocVol   := tv
+            pocPrice := pp
+
+    if not na(pocLine)
+        line.delete(pocLine)
+    if not na(pocLabel)
+        label.delete(pocLabel)
+
+    pocLine  := line.new(bar_index - lookback, pocPrice, bar_index, pocPrice, color=color.new(color.white, 40), style=line.style_dashed, width=1)
+    pocLabel := label.new(bar_index, pocPrice, "POC " + str.tostring(pocPrice, format.mintick), style=label.style_label_left, color=color.new(color.white, 75), textcolor=color.white, size=size.tiny)
